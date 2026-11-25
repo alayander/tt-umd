@@ -134,8 +134,11 @@ DeviceCommandResult BlackholeDeviceFirmware::send_device_command(
     // Serializes against other processes messaging the same device's ARC.
     auto lock = LockManager::acquire_mutex(MutexType::ARC_MSG, device_id_, get_io_device_type());
 
+    // Pass the full 32-bit msg_code through: byte 0 is the command, and higher bytes can carry
+    // command-specific fields (e.g. the characterization submessage ID in byte 1). Casting to the
+    // 8-bit ArcMessageType here would truncate those fields.
     std::vector<uint32_t> return_values;
-    uint32_t exit_code = arc_msg_queue_->send_message((ArcMessageType)msg_code, return_values, args, timeout, noc_id);
+    uint32_t exit_code = arc_msg_queue_->send_message(msg_code, return_values, args, timeout, noc_id);
 
     log_debug(
         LogUMD,

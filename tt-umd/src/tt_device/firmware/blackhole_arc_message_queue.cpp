@@ -123,14 +123,25 @@ uint32_t BlackholeArcMessageQueue::send_message(
     const std::vector<uint32_t>& args,
     const std::chrono::milliseconds timeout_ms,
     const NocId noc_id) {
+    return send_message((uint32_t)message_type, return_values, args, timeout_ms, noc_id);
+}
+
+uint32_t BlackholeArcMessageQueue::send_message(
+    const uint32_t message_code,
+    std::vector<uint32_t>& return_values,
+    const std::vector<uint32_t>& args,
+    const std::chrono::milliseconds timeout_ms,
+    const NocId noc_id) {
     if (args.size() > 7) {
         UMD_THROW(
             error::RuntimeError,
             fmt::format("Blackhole ARC messages are limited to 7 arguments, but: {} were provided.", args.size()));
     }
 
-    // Initialize with zeros for unused args.
-    std::array<uint32_t, BlackholeArcMessageQueue::entry_len> request = {(uint32_t)message_type, 0, 0, 0, 0, 0, 0, 0};
+    // Initialize with zeros for unused args. message_code is the full word 0: the low byte is the
+    // command, and higher bytes carry command-specific fields (e.g. the characterization submessage
+    // ID in byte 1).
+    std::array<uint32_t, BlackholeArcMessageQueue::entry_len> request = {message_code, 0, 0, 0, 0, 0, 0, 0};
 
     // Copy provided arguments.
     for (size_t i = 0; i < args.size(); i++) {
@@ -151,7 +162,7 @@ uint32_t BlackholeArcMessageQueue::send_message(
     } else if (status == 0xFF) {
         UMD_THROW(
             error::RuntimeError,
-            fmt::format("Message code: {} not recognized by ARC firmware.", (uint32_t)message_type));
+            fmt::format("Message code: {} not recognized by ARC firmware.", message_code));
         return 0;
     } else {
         UMD_THROW(error::RuntimeError, fmt::format("Unknown message error code: {}", status));

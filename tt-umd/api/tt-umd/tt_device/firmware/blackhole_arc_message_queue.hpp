@@ -76,6 +76,19 @@ public:
         const std::chrono::milliseconds timeout_ms = timeout::ARC_MESSAGE_TIMEOUT,
         const NocId noc_id = NocId::DEFAULT_NOC);
 
+    /*
+     * Send ARC message using the full 32-bit message code as word 0 of the request. The
+     * ArcMessageType overload forwards here. Use this when the request needs bits beyond the
+     * 8-bit command byte set in word 0 - for example the characterization submessage ID, which
+     * the firmware reads from byte 1 of word 0.
+     */
+    uint32_t send_message(
+        const uint32_t message_code,
+        std::vector<uint32_t>& return_values,
+        const std::vector<uint32_t>& args = {},
+        const std::chrono::milliseconds timeout_ms = timeout::ARC_MESSAGE_TIMEOUT,
+        const NocId noc_id = NocId::DEFAULT_NOC);
+
     static std::unique_ptr<BlackholeArcMessageQueue> get_blackhole_arc_message_queue(
         DeviceProtocol* device_protocol,
         JtagInterface* jtag_interface,
