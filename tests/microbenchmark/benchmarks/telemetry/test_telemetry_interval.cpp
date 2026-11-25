@@ -16,21 +16,16 @@
 #include <map>
 #include <memory>
 #include <sstream>
-#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 
-#include "tt-umd/arch/blackhole_implementation.hpp"
+#include "tt-umd/firmware_telemetry/firmware_telemetry_reader.hpp"
 #include "tt-umd/pcie/pci_device.hpp"
 #include "tt-umd/tt_device/firmware/device_firmware.hpp"
-#include "tt-umd/tt_device/protocol/device_protocol.hpp"
 #include "tt-umd/tt_device/tt_device.hpp"
 #include "tt-umd/tt_device/tt_device_factory.hpp"
-#include "tt-umd/types/noc_id.hpp"
-#include "tt-umd/types/register_access_width.hpp"
 #include "tt-umd/types/telemetry.hpp"
-#include "tt-umd/types/xy_pair.hpp"
 #include "tt-umd/utils/timeouts.hpp"
 
 using namespace tt::umd;
@@ -127,116 +122,28 @@ double env_double(const char* name, double fallback) {
     return fallback;
 }
 
-// Reads the firmware telemetry table straight off the ARC core, the same way
-// BlackholeArcTelemetryReader does: tag-table address from SCRATCH_RAM_13 and values address from
-// SCRATCH_RAM_12 (both over the ARC XBAR), the tag->offset map parsed once at construction. Samples
-// are a single block read of the whole values array - one coherent snapshot, no per-sample re-init.
-class TelemTable {
-public:
-    TelemTable(DeviceProtocol* proto, tt_xy_pair arc_core, NocId noc) : proto_(proto), core_(arc_core), noc_(noc) {
-        // Wait for ARC to publish the table pointer (non-zero SCRATCH_RAM_13), then parse once.
-        uint32_t table_addr = 0;
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-        while (table_addr == 0 && std::chrono::steady_clock::now() < deadline) {
-            table_addr = read_ctrl32(blackhole::ARC_NOC_XBAR_ADDRESS_START + blackhole::SCRATCH_RAM_13);
-            if (table_addr == 0) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            }
-        }
-        values_addr_ = read_ctrl32(blackhole::ARC_NOC_XBAR_ADDRESS_START + blackhole::SCRATCH_RAM_12);
-
-        proto_->read_data(&entry_count_, core_, static_cast<uint64_t>(table_addr) + sizeof(uint32_t),
-                          sizeof(uint32_t), noc_);
-        if (entry_count_ == 0 || entry_count_ >= 1024) {
-            throw std::runtime_error("telemetry table has an implausible entry count (ARC not up?)");
-        }
-
-        // Tag table: one u32 per entry, low 16 = tag, high 16 = offset into the values array.
-        std::vector<uint32_t> tag_table(entry_count_);
-        proto_->read_data(tag_table.data(), core_, static_cast<uint64_t>(table_addr) + 2 * sizeof(uint32_t),
-                          entry_count_ * sizeof(uint32_t), noc_);
-        for (uint32_t e : tag_table) {
-            const uint16_t tag = e & 0xFFFF;
-            const uint16_t offset = e >> 16;
-            tags_.push_back(tag);
-            tag_to_offset_[tag] = offset;
-            if (tag == TelemetryTag::TIMER_HEARTBEAT) {
-                hb_offset_ = offset;
-            }
-            if (tag == TelemetryTag::UPDATE_TELEM_SPEED) {
-                update_speed_offset_ = offset;
-            }
-        }
-    }
-
-    // Tags present in the table, in table order.
-    const std::vector<uint16_t>& tags() const { return tags_; }
-
-    bool has_tag(uint16_t tag) const { return tag_to_offset_.count(tag) != 0; }
-
-    // Index of a tag's value within a full snapshot (see read_snapshot).
-    uint16_t offset_for(uint16_t tag) const {
-        auto it = tag_to_offset_.find(tag);
-        return it != tag_to_offset_.end() ? it->second : 0;
-    }
-
-    uint32_t entry_count() const { return entry_count_; }
-
-    uint32_t read_heartbeat() { return read_value_word(hb_offset_); }
-
-    uint32_t read_update_speed() { return read_value_word(update_speed_offset_); }
-
-    // One block read of the whole values array into out, indexed by offset (offset_for()).
-    void read_snapshot(std::vector<uint32_t>& out) {
-        out.resize(entry_count_);
-        proto_->read_data(out.data(), core_, values_addr_, entry_count_ * sizeof(uint32_t), noc_);
-    }
-
-private:
-    uint32_t read_ctrl32(uint64_t addr) {
-        uint32_t v = 0;
-        proto_->read_ctrl(&v, core_, addr, sizeof(uint32_t), noc_, RegisterAccessWidth::BITS32);
-        return v;
-    }
-
-    uint32_t read_value_word(uint16_t offset) {
-        uint32_t v = 0;
-        proto_->read_data(&v, core_, values_addr_ + static_cast<uint64_t>(offset) * sizeof(uint32_t), sizeof(uint32_t),
-                          noc_);
-        return v;
-    }
-
-    DeviceProtocol* proto_;
-    tt_xy_pair core_;
-    NocId noc_;
-    uint64_t values_addr_ = 0;
-    uint32_t entry_count_ = 0;
-    std::vector<uint16_t> tags_;
-    std::map<uint16_t, uint16_t> tag_to_offset_;
-    uint16_t hb_offset_ = 0;
-    uint16_t update_speed_offset_ = 0;
-};
-
-// The subset of tags to accumulate/emit: names for the JSON header and their offsets into the full
-// snapshot. The full table is still read every sample; this only picks which columns we keep.
+// The subset of tags to accumulate/emit: display names for the JSON header and the tag ids to pull
+// from each sample. The full table is still read every sample; this only picks which columns we keep.
 struct TagSelection {
     std::vector<std::string> names;
-    std::vector<uint16_t> offsets;
+    std::vector<uint8_t> tags;
 };
 
-TagSelection resolve_tags(const TelemTable& tbl, const std::string& spec) {
+// available is a telemetry snapshot (tag -> value) used only to tell which tags this firmware's
+// table exposes, so unknown/absent tags can be skipped with a note.
+TagSelection resolve_tags(const std::map<uint8_t, uint32_t>& available, const std::string& spec) {
     TagSelection sel;
-    const auto add = [&](uint16_t id) {
-        if (!tbl.has_tag(id)) {
+    const auto add = [&](uint8_t id) {
+        if (available.count(id) == 0) {
             std::cerr << "[  TELEM   ] tag " << tag_id_to_name(id) << " not in this FW's table, skipping\n";
             return;
         }
         sel.names.push_back(tag_id_to_name(id));
-        sel.offsets.push_back(tbl.offset_for(id));
+        sel.tags.push_back(id);
     };
 
     if (spec == "all") {
-        for (uint16_t tag : tbl.tags()) {
+        for (const auto& [tag, value] : available) {
             add(tag);
         }
         return sel;
@@ -255,11 +162,11 @@ TagSelection resolve_tags(const TelemTable& tbl, const std::string& spec) {
             continue;
         }
         std::transform(token.begin(), token.end(), token.begin(), ::toupper);
-        uint16_t id = 0;
+        uint8_t id = 0;
         if (std::isdigit(static_cast<unsigned char>(token[0]))) {
-            id = static_cast<uint16_t>(std::strtol(token.c_str(), nullptr, 10));
+            id = static_cast<uint8_t>(std::strtol(token.c_str(), nullptr, 10));
         } else {
-            id = tag_id_from_name(token);
+            id = static_cast<uint8_t>(tag_id_from_name(token));
             if (id == 0) {
                 std::cerr << "[  TELEM   ] unknown tag '" << token << "', skipping\n";
                 continue;
@@ -276,12 +183,15 @@ uint32_t set_telem_interval(TTDevice* tt_device, uint32_t interval_ms) {
     return result.exit_code;
 }
 
-// Confirms the firmware applied the interval by reading UPDATE_TELEM_SPEED live off the table (the
-// firmware writes it synchronously in the set handler; poll briefly to stay robust).
-uint32_t read_applied_interval_ms(TelemTable& tbl, uint32_t expected_ms) {
+// Confirms the firmware applied the interval by reading UPDATE_TELEM_SPEED live (the firmware writes
+// it synchronously in the set handler; poll briefly to stay robust). read_all_entries re-reads the
+// table each call, so it reflects the new value - unlike read_entry, which caches this tag.
+uint32_t read_applied_interval_ms(FirmwareTelemetryReader* reader, uint32_t expected_ms) {
     uint32_t value = 0;
     for (int i = 0; i < 20; i++) {
-        value = tbl.read_update_speed();
+        const std::map<uint8_t, uint32_t> entries = reader->read_all_entries();
+        const auto it = entries.find(TelemetryTag::UPDATE_TELEM_SPEED);
+        value = it != entries.end() ? it->second : 0;
         if (value == expected_ms) {
             return value;
         }
@@ -332,24 +242,23 @@ struct ChipResult {
     std::vector<std::vector<uint32_t>> sample_values; // selected tag values per accumulated sample
 };
 
-// Samples for duration_s: polls the heartbeat (one word) to detect a new FW sample, and on each
-// change does one full-table block read, accumulating the whole table in memory along with a host
-// wall-clock timestamp. poll_us throttles the poll cadence (0 = flat-out); it should stay well below
-// the publish interval so every update is still caught - we default it to interval/3 at the call site.
-void sample_run(TelemTable& tbl, double duration_s, uint32_t poll_us, const std::vector<uint16_t>& sel_offsets,
-                ChipResult& out) {
+// Samples for duration_s: polls the heartbeat (one cheap word via read_entry) to detect a new FW
+// sample, and on each change does one coherent full-table read (read_all_entries), keeping the
+// requested tags in memory along with a host wall-clock timestamp. poll_us throttles the poll cadence
+// (0 = flat-out); it should stay well below the publish interval so every update is caught - we
+// default it to interval/3 at the call site.
+void sample_run(FirmwareTelemetryReader* reader, double duration_s, uint32_t poll_us,
+                const std::vector<uint8_t>& sel_tags, ChipResult& out) {
     out.poll_us = poll_us;
-    const uint16_t hb_offset = tbl.offset_for(TelemetryTag::TIMER_HEARTBEAT);
-    uint32_t last_hb = tbl.read_heartbeat();
+    uint32_t last_hb = reader->read_entry(TelemetryTag::TIMER_HEARTBEAT);
 
     const auto start = std::chrono::steady_clock::now();
     const auto end = start + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                                  std::chrono::duration<double>(duration_s));
     auto now = start;
-    std::vector<uint32_t> snapshot;
     while (now < end) {
         const auto iter_start = std::chrono::steady_clock::now();
-        const uint32_t hb = tbl.read_heartbeat();
+        const uint32_t hb = reader->read_entry(TelemetryTag::TIMER_HEARTBEAT);
         out.sweeps++;
         now = std::chrono::steady_clock::now();
         if (hb != last_hb) {
@@ -358,18 +267,21 @@ void sample_run(TelemTable& tbl, double duration_s, uint32_t poll_us, const std:
             // Record the host wall-clock time at the moment we detected this new sample.
             out.sample_host_ns.push_back(host_time_ns());
 
-            // Still read the whole table coherently, but keep only the requested columns.
-            tbl.read_snapshot(snapshot);
+            // Read the whole table coherently, then keep only the requested columns.
+            const std::map<uint8_t, uint32_t> snapshot = reader->read_all_entries();
             std::vector<uint32_t> row;
-            row.reserve(sel_offsets.size());
-            for (uint16_t off : sel_offsets) {
-                row.push_back(off < snapshot.size() ? snapshot[off] : 0);
+            row.reserve(sel_tags.size());
+            for (uint8_t tag : sel_tags) {
+                const auto it = snapshot.find(tag);
+                row.push_back(it != snapshot.end() ? it->second : 0);
             }
             out.sample_values.push_back(std::move(row));
 
             // Sync detection to the heartbeat in the snapshot we actually stored (it may have ticked
             // between the detect read and the block read), so stored rows stay strictly increasing.
-            last_hb = snapshot[hb_offset] >= hb ? snapshot[hb_offset] : hb;
+            const auto hb_it = snapshot.find(TelemetryTag::TIMER_HEARTBEAT);
+            const uint32_t snap_hb = hb_it != snapshot.end() ? hb_it->second : hb;
+            last_hb = snap_hb >= hb ? snap_hb : hb;
         }
         if (poll_us > 0 && now < end) {
             std::this_thread::sleep_until(iter_start + std::chrono::microseconds(poll_us));
@@ -448,7 +360,7 @@ void write_json(std::ostream& os, uint32_t interval_ms, double duration_s, const
 }  // namespace
 
 // Characterizes the telemetry update interval against the DVFS loop, entirely on the tt-umd layer
-// (TTDevice + direct telemetry-table reads), so the same sequence drops into tt-metal. It runs on a
+// (TTDevice + its FirmwareTelemetryReader), so the same sequence drops into tt-metal. It runs on a
 // single chip - TT_TELEM_CHIP (index into the enumerated device list), defaulting to the first chip
 // (0) - and:
 //   1. sets the interval to a configurable knob (default 3ms) via the PR #1448 message,
@@ -493,9 +405,9 @@ protected:
             return;
         }
         // Restore the default interval regardless of what the test body did, and confirm it took.
-        TelemTable tbl(tt_device_->get_device_protocol(), tt_device_->get_arc_core(NocId::NOC0), NocId::NOC0);
+        FirmwareTelemetryReader* reader = tt_device_->get_firmware_telemetry_reader();
         EXPECT_NO_THROW({ EXPECT_EQ(set_telem_interval(tt_device_.get(), DEFAULT_TELEM_INTERVAL_MS), 0u); });
-        EXPECT_EQ(read_applied_interval_ms(tbl, DEFAULT_TELEM_INTERVAL_MS), DEFAULT_TELEM_INTERVAL_MS);
+        EXPECT_EQ(read_applied_interval_ms(reader, DEFAULT_TELEM_INTERVAL_MS), DEFAULT_TELEM_INTERVAL_MS);
         tt_device_->set_power_state(TTDevice::PowerState::IDLE);
     }
 
@@ -520,23 +432,23 @@ TEST_F(BlackholeTelemetryInterval, SweepUpdateInterval) {
 
     {
         TTDevice* tt_device = tt_device_.get();
-        TelemTable tbl(tt_device->get_device_protocol(), tt_device->get_arc_core(NocId::NOC0), NocId::NOC0);
+        FirmwareTelemetryReader* reader = tt_device->get_firmware_telemetry_reader();
 
         // 1. Set the interval knob and confirm the firmware actually applied it.
         uint32_t exit_code = 0;
         EXPECT_NO_THROW({ exit_code = set_telem_interval(tt_device, knob_ms); });
         EXPECT_EQ(exit_code, 0u);
-        EXPECT_EQ(read_applied_interval_ms(tbl, knob_ms), knob_ms);
+        EXPECT_EQ(read_applied_interval_ms(reader, knob_ms), knob_ms);
 
         // 2. Clear the DVFS counters so the post-run read reflects only this run window.
         clear_dvfs_counters(tt_device);
 
-        // 3. Sample: full-table block read every heartbeat change; keep only the requested columns.
-        TagSelection sel = resolve_tags(tbl, tag_spec);
+        // 3. Sample: full-table read every heartbeat change; keep only the requested columns.
+        TagSelection sel = resolve_tags(reader->read_all_entries(), tag_spec);
         ChipResult result;
         result.chip = chip_index_;
         result.columns = sel.names;
-        sample_run(tbl, duration_s, poll_us, sel.offsets, result);
+        sample_run(reader, duration_s, poll_us, sel.tags, result);
 
         // 4. Read the counters back (this run's dropped ticks etc.).
         result.counters = read_all_dvfs_counters(tt_device);

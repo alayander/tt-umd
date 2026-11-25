@@ -19,11 +19,12 @@ DVFS loop. The default interval (100 ms) is restored at the end.
    submessage `SET_TELEMETRY_UPDATE_INTERVAL` (`0x5`) packed into word 0. This relies on the
    `uint32_t send_device_command` path that preserves the full word 0 (the submessage id lives in
    byte 1).
-2. **Confirm applied** by reading `UPDATE_TELEM_SPEED` (tag 5) live off the table.
+2. **Confirm applied** by reading `UPDATE_TELEM_SPEED` (tag 5) live via the device's
+   `FirmwareTelemetryReader`.
 3. **Clear** the DVFS counters so they reflect only this run.
-4. **Sample**: parse the telemetry table once (tag table via `SCRATCH_RAM_13`, values via
-  `SCRATCH_RAM_12`), then poll `TIMER_HEARTBEAT`; on every change do one **full-table block read**
-   (coherent snapshot) and accumulate only the **requested tags** in memory, with a host timestamp.
+4. **Sample**: poll `TIMER_HEARTBEAT` (one cheap word via `read_entry`); on every change do one
+   coherent full-table read (`FirmwareTelemetryReader::read_all_entries`) and accumulate only the
+   **requested tags** in memory, with a host timestamp.
 5. **Read DVFS counters** back (this run's `dropped_ticks`, `max_period_us`, `max_pass_us`).
 6. **Restore** the default interval (100 ms) in `TearDown` and confirm.
 
@@ -118,7 +119,7 @@ https://docs.tenstorrent.com/tt-system-firmware/doxygen//group__telemetry__tags.
 
 Measured on a single p150a (table = 86 entries / 344 B):
 
-- **Full-table read (`read_snapshot`): ~17 µs** (p50 ≈ 17.0, p90 ≈ 17.7, rare max ≈ 66 µs). The 344 B
+- **Full-table read (`read_all_entries`): ~17 µs** (p50 ≈ 17.0, p90 ≈ 17.7, rare max ≈ 66 µs). The 344 B
   copy is sub-µs; almost all of this is the per-read **TLB reconfigure** (BAR0 register writes in UMD),
   not data movement. This is the per-chip overhead per sample.
 - **Single-word heartbeat poll: ~2.6 µs** — much cheaper, since it hits a TLB-cached window.
