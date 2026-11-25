@@ -27,6 +27,8 @@ public:
 
     bool is_entry_available(const uint8_t telemetry_tag, [[maybe_unused]] NocId noc_id = NocId::DEFAULT_NOC) override;
 
+    std::map<uint8_t, uint32_t> read_all_entries([[maybe_unused]] NocId noc_id = NocId::DEFAULT_NOC) override;
+
     // Constructs the reader and waits for the ARC telemetry table to be fully populated.
     //
     // legacy_telemetry_noc_addr is where the firmware reported it published the legacy Wormhole

@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 
 #include "tt-umd/types/noc_id.hpp"
 
@@ -30,5 +31,13 @@ public:
      * @return true if the entry exists in the firmware telemetry table.
      */
     virtual bool is_entry_available(uint8_t tag, [[maybe_unused]] NocId noc_id = NocId::DEFAULT_NOC) = 0;
+
+    /**
+     * @brief Reads every available telemetry entry in one coherent device read.
+     * @return Map of telemetry tag to value. A single read gives a consistent snapshot and live
+     *         values even for entries the reader caches as static, which repeated read_entry calls
+     *         do not. Prefer this over per-tag reads when sampling many tags or sampling fast.
+     */
+    virtual std::map<uint8_t, uint32_t> read_all_entries([[maybe_unused]] NocId noc_id = NocId::DEFAULT_NOC) = 0;
 };
 }  // namespace tt::umd

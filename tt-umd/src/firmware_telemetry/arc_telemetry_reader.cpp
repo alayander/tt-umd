@@ -149,6 +149,25 @@ bool ArcTelemetryReader::is_entry_available(const uint8_t telemetry_tag, NocId n
     return telemetry_values.find(telemetry_tag) != telemetry_values.end();
 }
 
+std::map<uint8_t, uint32_t> ArcTelemetryReader::read_all_entries(NocId noc_id) {
+    // One block read of the whole values array, then map each tag to its value via the offset table
+    // parsed at construction. Reading the array wholesale keeps the snapshot coherent and picks up
+    // live values even for tags cached in telemetry_values as static.
+    std::vector<uint32_t> values(entry_count);
+    device_protocol->read_data(
+        values.data(),
+        get_arc_core(get_selected_noc_id()),
+        telemetry_values_addr,
+        entry_count * sizeof(uint32_t),
+        get_selected_noc_id());
+
+    std::map<uint8_t, uint32_t> entries;
+    for (const auto& [tag, offset] : telemetry_offset) {
+        entries.emplace(static_cast<uint8_t>(tag), values[offset]);
+    }
+    return entries;
+}
+
 void ArcTelemetryReader::wait_for_telemetry_initialized(std::chrono::milliseconds timeout_ms) {
     constexpr auto busy_poll_window = std::chrono::microseconds(0);
     constexpr auto poll_interval = std::chrono::milliseconds(10);
